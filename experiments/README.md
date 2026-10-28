@@ -78,3 +78,11 @@ CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc_per_node=2 -m experiments
 ```
 
 双卡正常完整累积组的有效batch=1×2×16=32。非最后微批次使用DDP.no_sync，最后不足一组仍会更新，按实际微批次数归一化。各微批次的loss取平均；若最后微批次样本更少，并非按样本数加权。此实现不使用AMP，保持原CUDA扩展的float32输入。没有GPU峰值显存或完整训练验证结果；SPD本身仍可能在小显存卡上OOM。
+
+## CUDA Chamfer 提速
+
+默认 --chamfer-backend auto：CUDA训练优先使用环境中已安装的Simba `chamfer` 扩展，否则直接加载SnowflakeNet的Chamfer3D文件（避免同时导入EMD），必要时首次JIT编译。要求CUDA toolkit、兼容编译器和ninja。CUDA算子只提供最近邻索引，距离与梯度仍由匹配点对计算，避免sqrt(0)梯度问题。首次编译耗时不代表每批训练耗时。
+
+可以用 --chamfer-backend cuda 强制GPU算子；--chamfer-backend chunked 为显式慢速回退。CUDA加载失败会报错，不会静默回退。GT目标由16384→2048→512→256分层FPS获取并复用，取代各尺度分别从完整GT采样；与基线层级采样方式一致，但目标点集相对先前版本有所改变，应重新训练作公平对比。
+
+执行 `python -m experiments.chamfer_smoke` 对照CUDA与分块参考的距离和双方梯度。开发环境只验证CPU匹配点对路径，CUDA算子、显存与提速比尚未实测。正式训练先维持每卡1确认运行，再试每卡2/累积8或每卡4/累积4，以保持双卡有效batch32。

@@ -15,7 +15,7 @@ from experiments.distributed import setup, TrainingObjective
 from experiments.pointnet_diffusion import Experiment
 
 
-from experiments.losses import chamfer
+from experiments.losses import chamfer, configure_chamfer
 
 
 def main():
@@ -30,10 +30,12 @@ def main():
     p.add_argument('--steps', type=int, default=50)
     p.add_argument('--split', choices=['val', 'test'], default='val')
     p.add_argument('--device', default='cuda')
+    p.add_argument('--chamfer-backend', choices=['auto', 'cuda', 'chunked'], default='auto')
     p.add_argument('--batch-size', type=int, help='training batch size per GPU')
     p.add_argument('--eval-batch-size', type=int, help='evaluation batch size on rank 0')
     p.add_argument('--accum-steps', type=int, default=1)
     args = p.parse_args()
+    configure_chamfer(args.chamfer_backend)
     if args.accum_steps < 1 or any(v is not None and v < 1 for v in (args.batch_size, args.eval_batch_size)):
         p.error('batch sizes and accum-steps must be positive')
     if args.stage != 'teacher' and not args.checkpoint:

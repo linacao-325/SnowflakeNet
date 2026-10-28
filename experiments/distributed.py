@@ -32,11 +32,16 @@ class TrainingObjective(nn.Module):
         from models.utils import fps_subsample
         from experiments.losses import chamfer
         condition, kd = self.model.condition(partial, gt)
-        target = fps_subsample(gt, 256)
+        # Reuse a nested GT pyramid, matching the baseline's FPS hierarchy.
+        with torch.no_grad():
+            gt_2048 = fps_subsample(gt, 2048)
+            gt_512 = fps_subsample(gt_2048, 512)
+            target = fps_subsample(gt_512, 256)
+        targets = {256: target, 512: gt_512, 2048: gt_2048}
         diffusion, _, _ = self.model.diffusion.loss(target, condition)
         _, seeds, _ = self.model.diffusion.loss(target, condition, max_t=100)
         outputs = self.model.refine(seeds, partial, condition)
-        completion = sum(chamfer(x, fps_subsample(gt, x.shape[1])) for x in outputs[:-1])
+        completion = sum(chamfer(x, targets[x.shape[1]]) for x in outputs[:-1])
         completion = completion + chamfer(outputs[-1], gt) + chamfer(partial, outputs[-1], True)
         loss = diffusion + completion + self.kd_weight * kd
         return loss, torch.stack((diffusion.detach(), completion.detach(), kd.detach()))
