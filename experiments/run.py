@@ -3,6 +3,7 @@ import argparse
 import json
 import random
 import time
+from contextlib import nullcontext
 from pathlib import Path
 import numpy as np
 import torch
@@ -13,12 +14,7 @@ from experiments.distributed import setup, TrainingObjective
 from experiments.pointnet_diffusion import Experiment
 
 
-def chamfer(a, b, one_way=False):
-    # Exact chunked Euclidean CD-L1, same averaging convention as baseline.
-    def directed(x, y):
-        return torch.cat([torch.cdist(z, y).amin(-1) for z in x.split(256, 1)], 1).mean()
-    ab = directed(a, b)
-    return ab if one_way else (ab + directed(b, a)) / 2
+from experiments.losses import chamfer
 
 
 def main():
@@ -33,13 +29,20 @@ def main():
     p.add_argument('--steps', type=int, default=50)
     p.add_argument('--split', choices=['val', 'test'], default='val')
     p.add_argument('--device', default='cuda')
+    p.add_argument('--batch-size', type=int, help='training batch size per GPU')
+    p.add_argument('--eval-batch-size', type=int, help='evaluation batch size on rank 0')
+    p.add_argument('--accum-steps', type=int, default=1)
     args = p.parse_args()
+    if args.accum_steps < 1 or any(v is not None and v < 1 for v in (args.batch_size, args.eval_batch_size)):
+        p.error('batch sizes and accum-steps must be positive')
     if args.stage != 'teacher' and not args.checkpoint:
         p.error('student/eval require --checkpoint')
     random.seed(args.seed); np.random.seed(args.seed); torch.manual_seed(args.seed)
     from completion.utils.yaml_reader import read_yaml
     from completion.core.datasets.pcn import PCNDataLoader, collate_fn
     cfg = read_yaml(args.config)
+    if args.batch_size is not None: cfg.train.batch_size = args.batch_size
+    if args.eval_batch_size is not None: cfg.test.batch_size = args.eval_batch_size
     if cfg.dataset.name != 'PCN':
         p.error('this runner currently supports PCN only')
     device, rank, world = setup(args.device)
@@ -105,10 +108,19 @@ def main():
         objective.train(); sums = np.zeros(3); count = 0
         if isinstance(train.sampler, DistributedSampler):
             train.sampler.set_epoch(epoch)
-        for _, _, batch in train:
+        optimizer.zero_grad(set_to_none=True)
+        for batch_index, (_, _, batch) in enumerate(train):
             partial, gt = batch['partial_cloud'].to(device), batch['gtcloud'].to(device)
-            loss, components = objective(partial, gt)
-            optimizer.zero_grad(set_to_none=True); loss.backward(); optimizer.step()
+            group_start = (batch_index // args.accum_steps) * args.accum_steps
+            group_steps = min(args.accum_steps, len(train) - group_start)
+            synchronize = ((batch_index + 1) % args.accum_steps == 0 or batch_index + 1 == len(train))
+            context = objective.no_sync() if world > 1 and not synchronize else nullcontext()
+            with context:
+                loss, components = objective(partial, gt)
+                (loss / group_steps).backward()
+            if synchronize:
+                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
             sums += components.cpu().numpy() * len(gt)
             count += len(gt)
         totals = torch.tensor([*sums, count], device=device, dtype=torch.float64)

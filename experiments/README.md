@@ -65,3 +65,16 @@ torchrun --standalone --nproc_per_node=2 -m experiments.ddp_smoke
 ```
 
 该检查使用真实教师/学生和扩散模块，替代FPS/SPD，不代表完整CUDA算子的验证。
+
+## OOM 修复
+
+Chamfer已改为无梯度分块查找最近邻，再通过匹配点对计算距离和反传，避免旧版分块cdist保留全部距离矩阵的反向图。搜索仍是精确全点搜索，耗时仍需实测。随机无并列最近邻输入的距离值、双方梯度已与完整cdist对照通过；零距离梯度有限。并列最近邻采用首个索引。
+
+新增 --batch-size（每卡）、--eval-batch-size（仅rank0验证）和 --accum-steps。先从每卡1、验证1开始排错：
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc_per_node=2 -m experiments.run --config experiments/pcn.yaml --stage teacher --out work/teacher --batch-size 1 --eval-batch-size 1 --accum-steps 16
+CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc_per_node=2 -m experiments.run --config experiments/pcn.yaml --stage student --checkpoint work/teacher/last.pt --out work/student --batch-size 1 --eval-batch-size 1 --accum-steps 16
+```
+
+双卡正常完整累积组的有效batch=1×2×16=32。非最后微批次使用DDP.no_sync，最后不足一组仍会更新，按实际微批次数归一化。各微批次的loss取平均；若最后微批次样本更少，并非按样本数加权。此实现不使用AMP，保持原CUDA扩展的float32输入。没有GPU峰值显存或完整训练验证结果；SPD本身仍可能在小显存卡上OOM。

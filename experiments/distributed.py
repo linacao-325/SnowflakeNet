@@ -30,7 +30,7 @@ class TrainingObjective(nn.Module):
 
     def forward(self, partial, gt):
         from models.utils import fps_subsample
-        from experiments.run import chamfer
+        from experiments.losses import chamfer
         condition, kd = self.model.condition(partial, gt)
         target = fps_subsample(gt, 256)
         diffusion, _, _ = self.model.diffusion.loss(target, condition)
