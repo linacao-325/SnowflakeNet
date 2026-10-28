@@ -45,3 +45,23 @@ python -m experiments.run --config experiments/pcn.yaml --stage eval --checkpoin
 CPU PyTorch 2.3.1上 smoke 检查已通过：256维输出、池化点序不变性、教师阶段梯度、学生阶段教师冻结/无梯度、学生反传、有限梯度、固定随机种子的DDIM采样一致性、采样步数边界。Python编译检查和CLI --help通过。
 
 当前环境无GPU；PCN目录仅包含索引，无实际点云；Git克隆和pip下载代理连接失败。通过GitHub插件读取源码并在本地实现。本次尚未运行完整SPD前后向、真实数据训练或评估，没有CD提升、速度提升或收敛结论。
+
+
+## 双卡 DDP
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc_per_node=2 -m experiments.run --config experiments/pcn.yaml --stage teacher --out work/teacher
+CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc_per_node=2 -m experiments.run --config experiments/pcn.yaml --stage student --checkpoint work/teacher/last.pt --out work/student
+```
+
+每个进程绑定LOCAL_RANK对应GPU，NCCL同步梯度。训练使用DistributedSampler并每epoch调用set_epoch；样本数不整除卡数时按PyTorch默认补齐。训练指标在所有rank汇总，仅rank0写日志和保存不带DDP前缀的checkpoint。验证/测试由rank0遍历完整划分，其他rank等待，避免重复统计。
+
+配置 train.batch_size 是**每卡**batch size，默认32，双卡总batch=64。若保持原单卡总batch=32，改为每卡16；学习率默认仍为.001。train.num_workers同样是每进程设置。单卡启动命令仍然可用。
+
+双卡补丁已通过Python编译、核心CPU smoke和训练objective的CPU前后向检查（FPS/SPD使用替代实现）。本环境禁止创建本地socket，torchrun的双进程检查在rendezvous初始化时受阻；尚未实测双GPU/NCCL。可在训练机执行双CPU检查：
+
+```bash
+torchrun --standalone --nproc_per_node=2 -m experiments.ddp_smoke
+```
+
+该检查使用真实教师/学生和扩散模块，替代FPS/SPD，不代表完整CUDA算子的验证。

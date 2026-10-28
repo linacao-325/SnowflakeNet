@@ -6,6 +6,10 @@ import time
 from pathlib import Path
 import numpy as np
 import torch
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data.distributed import DistributedSampler
+from experiments.distributed import setup, TrainingObjective
 from experiments.pointnet_diffusion import Experiment
 
 
@@ -35,11 +39,11 @@ def main():
     random.seed(args.seed); np.random.seed(args.seed); torch.manual_seed(args.seed)
     from completion.utils.yaml_reader import read_yaml
     from completion.core.datasets.pcn import PCNDataLoader, collate_fn
-    from models.utils import fps_subsample
     cfg = read_yaml(args.config)
     if cfg.dataset.name != 'PCN':
         p.error('this runner currently supports PCN only')
-    device = torch.device(args.device)
+    device, rank, world = setup(args.device)
+    primary = rank == 0
     model = Experiment().to(device)
     if args.checkpoint:
         checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=False)
@@ -50,13 +54,17 @@ def main():
         model.load_state_dict(checkpoint['model'])
     model.set_stage('teacher' if args.stage == 'teacher' else 'student')
     out = Path(args.out); out.mkdir(parents=True, exist_ok=True)
-    (out / 'arguments.json').write_text(json.dumps(vars(args), indent=2))
+    if primary:
+        (out / 'arguments.json').write_text(json.dumps(vars(args), indent=2))
 
     def loader(split):
-        return torch.utils.data.DataLoader(PCNDataLoader(cfg).get_dataset(split),
+        dataset = PCNDataLoader(cfg).get_dataset(split)
+        sampler = DistributedSampler(dataset, num_replicas=world, rank=rank,
+                                     seed=args.seed, shuffle=True) if split == 'train' and world > 1 else None
+        return torch.utils.data.DataLoader(dataset,
             batch_size=cfg.train.batch_size if split == 'train' else cfg.test.batch_size,
-            shuffle=split == 'train', num_workers=cfg.train.num_workers,
-            collate_fn=collate_fn)
+            shuffle=split == 'train' and sampler is None, sampler=sampler,
+            num_workers=cfg.train.num_workers, collate_fn=collate_fn)
 
     @torch.no_grad()
     def evaluate(data):
@@ -76,34 +84,44 @@ def main():
                 'shapes': count, 'steps': args.steps, 'timing': 'includes first batch, excludes data loading and CD'}
 
     if args.stage == 'eval':
-        result = evaluate(loader(args.split))
-        (out / 'metrics.json').write_text(json.dumps(result, indent=2)); print(result)
+        if primary:
+            result = evaluate(loader(args.split))
+            (out / 'metrics.json').write_text(json.dumps(result, indent=2)); print(result)
+        if world > 1:
+            dist.barrier(); dist.destroy_process_group()
         return
     optimizer = torch.optim.Adam(filter(lambda x: x.requires_grad, model.parameters()), lr=.001)
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, 50, gamma=.5)
+    objective = TrainingObjective(model, args.kd_weight).to(device)
+    if world > 1:
+        objective = DDP(objective, device_ids=[device.index] if device.type == 'cuda' else None)
+    # DDP synchronized initialization; use different per-rank training noise.
+    random.seed(args.seed + rank); np.random.seed(args.seed + rank); torch.manual_seed(args.seed + rank)
     train = loader('train')
     # Stage 1 has GT-conditioned features and cannot give student validation metrics.
-    validation = loader('val') if args.stage == 'student' else None
+    validation = loader('val') if args.stage == 'student' and primary else None
     best = float('inf')
     for epoch in range(args.epochs):
-        model.train(); sums = np.zeros(3); count = 0
+        objective.train(); sums = np.zeros(3); count = 0
+        if isinstance(train.sampler, DistributedSampler):
+            train.sampler.set_epoch(epoch)
         for _, _, batch in train:
             partial, gt = batch['partial_cloud'].to(device), batch['gtcloud'].to(device)
-            condition, kd = model.condition(partial, gt)
-            target = fps_subsample(gt, 256)
-            diffusion, _, _ = model.diffusion.loss(target, condition)
-            # Train SPD on low-noise x0 estimates; full noise range trains epsilon.
-            _, seeds, _ = model.diffusion.loss(target, condition, max_t=100)
-            outputs = model.refine(seeds, partial, condition)
-            completion = sum(chamfer(x, fps_subsample(gt, x.shape[1])) for x in outputs[:-1])
-            completion = completion + chamfer(outputs[-1], gt) + chamfer(partial, outputs[-1], True)
-            loss = diffusion + completion + args.kd_weight * kd
+            loss, components = objective(partial, gt)
             optimizer.zero_grad(set_to_none=True); loss.backward(); optimizer.step()
-            sums += np.array([diffusion.item(), completion.item(), kd.item()]) * len(gt)
+            sums += components.cpu().numpy() * len(gt)
             count += len(gt)
+        totals = torch.tensor([*sums, count], device=device, dtype=torch.float64)
+        if world > 1: dist.all_reduce(totals)
+        sums = totals[:3].cpu().numpy(); count = int(totals[3].item())
         if not count: raise RuntimeError('empty train split')
         scheduler.step()
         record = dict(epoch=epoch+1, diffusion=sums[0]/count, completion=sums[1]/count, kd=sums[2]/count)
+        # Rank 0 evaluates the complete split without sampler padding or duplicates.
+        if world > 1: dist.barrier()
+        if not primary:
+            dist.barrier()
+            continue
         score = None
         if validation is not None:
             record.update(evaluate(validation)); score = record['cd_l1_x1000']
@@ -114,6 +132,8 @@ def main():
             best = score; torch.save(checkpoint, out / 'best.pt')
         with (out / 'metrics.jsonl').open('a') as f: f.write(json.dumps(record)+'\n')
         print(record, flush=True)
+        if world > 1: dist.barrier()
+    if world > 1: dist.destroy_process_group()
 
 
 if __name__ == '__main__':
