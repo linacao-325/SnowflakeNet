@@ -7,6 +7,7 @@ from contextlib import nullcontext
 from pathlib import Path
 import numpy as np
 import torch
+from tqdm import tqdm
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
@@ -74,7 +75,8 @@ def main():
         model.eval()
         total, count, seconds = 0., 0, 0.
         generator = torch.Generator(device=device).manual_seed(args.seed)
-        for _, _, batch in data:
+        progress = tqdm(data, desc='Evaluation', disable=not primary, dynamic_ncols=True)
+        for _, _, batch in progress:
             partial, gt = batch['partial_cloud'].to(device), batch['gtcloud'].to(device)
             if device.type == 'cuda': torch.cuda.synchronize()
             start = time.perf_counter()
@@ -82,6 +84,8 @@ def main():
             if device.type == 'cuda': torch.cuda.synchronize()
             seconds += time.perf_counter() - start
             total += chamfer(prediction, gt).item() * len(gt); count += len(gt)
+            if primary:
+                progress.set_postfix(cd_l1_x1000=f'{total / count * 1000:.4f}')
         if not count: raise RuntimeError('empty evaluation split')
         return {'cd_l1_x1000': total / count * 1000, 'seconds_per_shape': seconds / count,
                 'shapes': count, 'steps': args.steps, 'timing': 'includes first batch, excludes data loading and CD'}
@@ -100,16 +104,24 @@ def main():
         objective = DDP(objective, device_ids=[device.index] if device.type == 'cuda' else None)
     # DDP synchronized initialization; use different per-rank training noise.
     random.seed(args.seed + rank); np.random.seed(args.seed + rank); torch.manual_seed(args.seed + rank)
+    if primary:
+        print(f'Preparing PCN loaders: stage={args.stage}, GPUs/processes={world}, '
+              f'batch/GPU={cfg.train.batch_size}, accumulation={args.accum_steps}', flush=True)
     train = loader('train')
     # Stage 1 has GT-conditioned features and cannot give student validation metrics.
     validation = loader('val') if args.stage == 'student' and primary else None
+    if primary:
+        print(f'Training samples per rank: {len(train.sampler)}; '
+              f'batches per epoch: {len(train)}', flush=True)
     best = float('inf')
     for epoch in range(args.epochs):
         objective.train(); sums = np.zeros(3); count = 0
         if isinstance(train.sampler, DistributedSampler):
             train.sampler.set_epoch(epoch)
         optimizer.zero_grad(set_to_none=True)
-        for batch_index, (_, _, batch) in enumerate(train):
+        progress = tqdm(train, desc=f'{args.stage} epoch {epoch + 1}/{args.epochs}',
+                        disable=not primary, dynamic_ncols=True)
+        for batch_index, (_, _, batch) in enumerate(progress):
             partial, gt = batch['partial_cloud'].to(device), batch['gtcloud'].to(device)
             group_start = (batch_index // args.accum_steps) * args.accum_steps
             group_steps = min(args.accum_steps, len(train) - group_start)
@@ -123,6 +135,11 @@ def main():
                 optimizer.zero_grad(set_to_none=True)
             sums += components.cpu().numpy() * len(gt)
             count += len(gt)
+            if primary:
+                progress.set_postfix(loss=f'{loss.item():.4f}',
+                                     diffusion=f'{components[0].item():.4f}',
+                                     completion=f'{components[1].item():.4f}',
+                                     kd=f'{components[2].item():.4f}')
         totals = torch.tensor([*sums, count], device=device, dtype=torch.float64)
         if world > 1: dist.all_reduce(totals)
         sums = totals[:3].cpu().numpy(); count = int(totals[3].item())
@@ -143,7 +160,7 @@ def main():
         if score is not None and score < best:
             best = score; torch.save(checkpoint, out / 'best.pt')
         with (out / 'metrics.jsonl').open('a') as f: f.write(json.dumps(record)+'\n')
-        print(record, flush=True)
+        tqdm.write(json.dumps(record))
         if world > 1: dist.barrier()
     if world > 1: dist.destroy_process_group()
 
